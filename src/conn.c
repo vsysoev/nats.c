@@ -31,6 +31,7 @@
 #include "msg.h"
 #include "asynccb.h"
 #include "comsock.h"
+#include "nkeys.h"
 
 #define DEFAULT_SCRATCH_SIZE    (512)
 #define DEFAULT_BUF_SIZE        (32768)
@@ -160,6 +161,8 @@ _clearServerInfo(natsServerInfo *si)
     for (i=0; i<si->connectURLsCount; i++)
         NATS_FREE(si->connectURLs[i]);
     NATS_FREE(si->connectURLs);
+
+    NATS_FREE(si->nonce);
 
     memset(si, 0, sizeof(natsServerInfo));
 }
@@ -541,6 +544,9 @@ _processInfo(natsConnection *nc, char *info, int len)
     if (s == NATS_OK)
         s = nats_JSONGetValue(json, "client_id", TYPE_LONG,
                               (void**) &(nc->info.CID));
+    if (s == NATS_OK)
+        s = nats_JSONGetValue(json, "nonce", TYPE_STR,
+                              (void**) &(nc->info.nonce));
 
 #if 0
     fprintf(stderr, "Id=%s Version=%s Host=%s Port=%d Auth=%s SSL=%s Payload=%d Proto=%d\n",
@@ -736,15 +742,27 @@ _processExpectedInfo(natsConnection *nc)
     return NATS_UPDATE_ERR_STACK(s);
 }
 
+static bool
+_isEmpty(char *str)
+{
+    return (((str == NULL) || (str[0] == '\0')) ? true : false);
+}
+
 static natsStatus
 _connectProto(natsConnection *nc, char **proto)
 {
+    natsStatus  s     = NATS_OK;
     natsOptions *opts = nc->opts;
     const char  *token= NULL;
     const char  *user = NULL;
     const char  *pwd  = NULL;
     const char  *name = NULL;
+    char        *sig  = NULL;
+    char        *ujwt = NULL;
+    char        *nkey = NULL;
     int         res;
+    unsigned char   *sigRaw    = NULL;
+    int             sigRawLen  = 0;
 
     // Check if NoEcho is set and we have a server that supports it.
     if (opts->noEcho && (nc->info.proto < 1))
@@ -765,43 +783,75 @@ _connectProto(natsConnection *nc, char **proto)
         user  = opts->user;
         pwd   = opts->password;
         token = opts->token;
+        nkey  = opts->nkey;
     }
 
-    if (opts->tokenCb != NULL)
+    if (opts->userJWTHandler != NULL)
+    {
+        s = opts->userJWTHandler(opts->userJWTClosure, (void*) &ujwt);
+        if ((s == NATS_OK) && !_isEmpty(nkey))
+            s = nats_setError(NATS_ILLEGAL_STATE, "%s", "user JWT callback and NKey cannot be both specified");
+    }
+
+    if ((s == NATS_OK) && (!_isEmpty(ujwt) || !_isEmpty(nkey)))
+    {
+        s = opts->sigHandler(nc->info.nonce, opts->sigClosure, &sigRaw, &sigRawLen);
+        if (s == NATS_OK)
+            s = nats_Base64RawURL_EncodeString((const unsigned char*) sigRaw, sigRawLen, &sig);
+    }
+
+    if ((s == NATS_OK) && (opts->tokenCb != NULL))
     {
         if (token != NULL)
-            return nats_setError(NATS_ILLEGAL_STATE, "%s", "Token and token handler options cannot be both set");
+            s = nats_setError(NATS_ILLEGAL_STATE, "%s", "Token and token handler options cannot be both set");
 
-        token = opts->tokenCb(opts->tokenCbClosure);
+        if (s == NATS_OK)
+            token = opts->tokenCb(opts->tokenCbClosure);
     }
 
-    if (opts->name != NULL)
+    if ((s == NATS_OK) && (opts->name != NULL))
         name = opts->name;
 
-    res = nats_asprintf(proto,
-                        "CONNECT {\"verbose\":%s,\"pedantic\":%s,%s%s%s%s%s%s%s%s%s\"tls_required\":%s," \
-                        "\"name\":\"%s\",\"lang\":\"%s\",\"version\":\"%s\",\"protocol\":%d,\"echo\":%s}%s",
-                        nats_GetBoolStr(opts->verbose),
-                        nats_GetBoolStr(opts->pedantic),
-                        (user != NULL ? "\"user\":\"" : ""),
-                        (user != NULL ? user : ""),
-                        (user != NULL ? "\"," : ""),
-                        (pwd != NULL ? "\"pass\":\"" : ""),
-                        (pwd != NULL ? pwd : ""),
-                        (pwd != NULL ? "\"," : ""),
-                        (token != NULL ? "\"auth_token\":\"" :""),
-                        (token != NULL ? token : ""),
-                        (token != NULL ? "\"," : ""),
-                        nats_GetBoolStr(opts->secure),
-                        (name != NULL ? name : ""),
-                        CString, NATS_VERSION_STRING,
-                        CLIENT_PROTO_INFO,
-                        nats_GetBoolStr(!opts->noEcho),
-                        _CRLF_);
-    if (res < 0)
-        return NATS_NO_MEMORY;
+    if (s == NATS_OK)
+    {
+        res = nats_asprintf(proto,
+                            "CONNECT {\"verbose\":%s,\"pedantic\":%s,%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\"tls_required\":%s," \
+                            "\"name\":\"%s\",\"lang\":\"%s\",\"version\":\"%s\",\"protocol\":%d,\"echo\":%s}%s",
+                            nats_GetBoolStr(opts->verbose),
+                            nats_GetBoolStr(opts->pedantic),
+                            (nkey != NULL ? "\"nkey\":\"" : ""),
+                            (nkey != NULL ? nkey : ""),
+                            (nkey != NULL ? "\"," : ""),
+                            (ujwt != NULL ? "\"jwt\":\"" : ""),
+                            (ujwt != NULL ? ujwt : ""),
+                            (ujwt != NULL ? "\"," : ""),
+                            (sig != NULL ? "\"sig\":\"" : ""),
+                            (sig != NULL ? sig : ""),
+                            (sig != NULL ? "\"," : ""),
+                            (user != NULL ? "\"user\":\"" : ""),
+                            (user != NULL ? user : ""),
+                            (user != NULL ? "\"," : ""),
+                            (pwd != NULL ? "\"pass\":\"" : ""),
+                            (pwd != NULL ? pwd : ""),
+                            (pwd != NULL ? "\"," : ""),
+                            (token != NULL ? "\"auth_token\":\"" :""),
+                            (token != NULL ? token : ""),
+                            (token != NULL ? "\"," : ""),
+                            nats_GetBoolStr(opts->secure),
+                            (name != NULL ? name : ""),
+                            CString, NATS_VERSION_STRING,
+                            CLIENT_PROTO_INFO,
+                            nats_GetBoolStr(!opts->noEcho),
+                            _CRLF_);
+        if (res < 0)
+            s = nats_setDefaultError(NATS_NO_MEMORY);
+    }
 
-    return NATS_OK;
+    NATS_FREE(ujwt);
+    NATS_FREE(sigRaw);
+    NATS_FREE(sig);
+
+    return s;
 }
 
 static natsStatus

@@ -154,6 +154,7 @@ typedef struct __natsServerInfo
     int         connectURLsCount;
     int         proto;
     uint64_t    CID;
+    char        *nonce;
 
 } natsServerInfo;
 
@@ -177,6 +178,13 @@ typedef struct
     natsEvLoop_Detach           detach;
 
 } natsEvLoopCallbacks;
+
+typedef struct __userCreds
+{
+    char        *userOrChainedFile;
+    char        *seedFile;
+
+} userCreds;
 
 struct __natsOptions
 {
@@ -252,6 +260,16 @@ struct __natsOptions
     // If set to true, in case of failed connect, tries again using
     // reconnect options values.
     bool                    retryOnFailedConnect;
+
+    natsUserJWTHandler      userJWTHandler;
+    void                    *userJWTClosure;
+
+    natsSignatureHandler    sigHandler;
+    void                    *sigClosure;
+
+    char                    *nkey;
+
+    userCreds               *userCreds;
 };
 
 typedef struct __natsMsgList

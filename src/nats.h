@@ -273,6 +273,17 @@ typedef natsStatus (*natsEvLoop_WriteAddRemove)(
 typedef natsStatus (*natsEvLoop_Detach)(
         void            *userData);
 
+
+typedef natsStatus (*natsUserJWTHandler)(
+        void            *closure,
+        char            **userJWT);
+
+typedef natsStatus (*natsSignatureHandler)(
+        const char      *nonce,
+        void            *closure,
+        unsigned char   **signature,
+        int             *signatureLength);
+
 /** \brief Callback used to build a token on connections and reconnections.
  *
  * This is the function that one provides to build a different token at each reconnect.
@@ -1348,6 +1359,18 @@ natsOptions_SetNoEcho(natsOptions *opts, bool noEcho);
 NATS_EXTERN natsStatus
 natsOptions_SetRetryOnFailedConnect(natsOptions *opts, bool retry,
         natsConnectionHandler connectedCb, void* closure);
+
+natsStatus
+natsOptions_SetUserCredentialsFromFiles(natsOptions *opts,
+                                        char *userOrChainedFile,
+                                        char *seedFile);
+
+natsStatus
+natsOptions_SetUserCredentialsCallbacks(natsOptions *opts,
+                                        natsUserJWTHandler      ujwtCB,
+                                        void                    *ujwtClosure,
+                                        natsSignatureHandler    sigCB,
+                                        void                    *sigClosure);
 
 /** \brief Destroys a #natsOptions object.
  *

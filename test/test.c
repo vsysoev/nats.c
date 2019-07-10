@@ -29,6 +29,8 @@
 #include "msg.h"
 #include "stats.h"
 #include "comsock.h"
+#include "crypto.h"
+#include "nkeys.h"
 #if defined(NATS_HAS_STREAMING)
 #include "stan/conn.h"
 #include "stan/pub.h"
@@ -77,6 +79,8 @@ static const char *clusterName = "test-cluster";
 static const char *clientName  = "client";
 #endif
 
+typedef natsStatus (*testCheckInfoCB)(char *buffer);
+
 struct threadArg
 {
     natsMutex       *m;
@@ -104,6 +108,7 @@ struct threadArg
     int             results[10];
     const char      *tokens[3];
     int             tokenCallCount;
+    testCheckInfoCB checkInfoCB;
 
 
     natsSubscription *sub;
@@ -3191,6 +3196,183 @@ test_natsMsg(void)
     testCond((s == NATS_OK) && (msg != NULL));
 
     natsMsg_Destroy(msg);
+}
+
+static void
+test_natsBase32Decode(void)
+{
+    natsStatus      s;
+    const char      *src       = "KRUGS4ZANFZSA5DIMUQHEZLTOVWHIIDPMYQGCIDCMFZWKMZSEBSGKY3PMRUW4ZY";
+    const char      *expected  = "This is the result of a base32 decoding";
+    char            dst[256];
+    int             dstLen = 0;
+
+    test("Decode: ");
+    s = nats_Base32_DecodeString((char*) src, dst, (int) sizeof(dst), &dstLen);
+    testCond((s == NATS_OK)
+                && (dstLen == (int) strlen(expected))
+                && (memcmp((void*) expected, (void*) dst, dstLen) == 0));
+
+    test("Dest too small: ");
+    if (s == NATS_OK)
+        s = nats_Base32_DecodeString((char*) src, dst, 10, &dstLen);
+    testCond((s == NATS_INSUFFICIENT_BUFFER) && (dstLen == 0));
+    if (s == NATS_INSUFFICIENT_BUFFER)
+    {
+        s = NATS_OK;
+        nats_clearLastError();
+    }
+
+    test("Invalid string: ");
+    if (s == NATS_OK)
+        s = nats_Base32_DecodeString((char*)"This is invalid content", dst, (int) sizeof(dst), &dstLen);
+    testCond((s == NATS_ERR)
+                && (nats_GetLastError(NULL) != NULL)
+                && (strstr(nats_GetLastError(NULL), "invalid") != NULL));
+}
+
+static void
+test_natsBase64Encode(void)
+{
+    natsStatus  s;
+    char        *enc = NULL;
+    int         i;
+    const char  *testStrings[] = {
+            "this is testing base64 encoding",
+            "dfslfdlkjsfdllkjfds dfsjlklkfsda dfsalkjklfdsalkj adfskjllkjfdaslkjfdslk",
+            "This is another with numbers like 12345678.90 and special characters !@#$%^&*()-=+",
+    };
+    const char  *expectedResults[] = {
+            "dGhpcyBpcyB0ZXN0aW5nIGJhc2U2NCBlbmNvZGluZw",
+            "ZGZzbGZkbGtqc2ZkbGxramZkcyBkZnNqbGtsa2ZzZGEgZGZzYWxramtsZmRzYWxraiBhZGZza2psbGtqZmRhc2xramZkc2xr",
+            "VGhpcyBpcyBhbm90aGVyIHdpdGggbnVtYmVycyBsaWtlIDEyMzQ1Njc4LjkwIGFuZCBzcGVjaWFsIGNoYXJhY3RlcnMgIUAjJCVeJiooKS09Kw",
+    };
+
+    test("Encode nil: ");
+    s = nats_Base64RawURL_EncodeString(NULL, 0, &enc);
+    testCond((s == NATS_OK) && (enc == NULL));
+
+    test("Encode empty: ");
+    s = nats_Base64RawURL_EncodeString((const unsigned char*) "", 0, &enc);
+    testCond((s == NATS_OK) && (enc == NULL));
+
+    test("Encode strings: ");
+    for (i=0; i<(int)(sizeof(testStrings)/sizeof(char*)); i++)
+    {
+        s = nats_Base64RawURL_EncodeString((const unsigned char*) testStrings[i], (int)strlen(testStrings[i]), &enc);
+        if ((s == NATS_OK) && ((enc == NULL) || (strcmp(enc, expectedResults[i]) != 0)))
+            s = NATS_ERR;
+
+        free(enc);
+        enc = NULL;
+        if (s != NATS_OK)
+            break;
+    }
+    testCond(s == NATS_OK);
+
+    test("Encode bytes: ");
+    {
+        const uint8_t   src[] = {1, 2, 0, 3, 4, 5, 0, 6, 7, 8, 0, 9, 0};
+        int             len = 13;
+
+        enc = NULL;
+
+        s = nats_Base64RawURL_EncodeString((const unsigned char*) &src, len, &enc);
+        if ((s == NATS_OK) && ((enc == NULL) || (strcmp(enc, "AQIAAwQFAAYHCAAJAA") != 0)))
+            s = NATS_ERR;
+
+        free(enc);
+    }
+    testCond(s == NATS_OK);
+}
+
+static void
+test_natsCRC16(void)
+{
+    natsStatus      s;
+    unsigned char   a[] = {153, 209, 36, 74, 103, 32, 65, 34, 111, 68, 104, 156, 50, 14, 164, 140, 144, 230};
+    uint16_t        crc = 0;
+    uint16_t        expected = 10272;
+
+    test("Compute: ");
+    crc = nats_CRC16_Compute(a, (int)sizeof(a));
+    testCond(crc == expected);
+
+    test("Verify: ");
+    testCond(nats_CRC16_Validate(a, (int)sizeof(a), expected));
+
+    test("Expect failure: ");
+    a[3] = 63;
+    testCond(!nats_CRC16_Validate(a, (int)sizeof(a), expected));
+}
+
+static void
+test_natsKeys(void)
+{
+    natsStatus          s;
+    unsigned char       *out       = NULL;
+    int                 outLen     = 0;
+    const char          *nonce     = "nonce";
+    const unsigned char expected[] = {
+            155, 157,   8, 183,  93, 154,  78,   7,
+            219,  39,  11,  16, 134, 231,  46, 142,
+            168,  87, 110, 202, 187, 180, 179,  62,
+             49, 255, 225,  74,  48,  80, 176, 111,
+            248, 162, 121, 188, 203, 101, 100, 195,
+            162,  70, 213, 182, 220,  14,  71, 113,
+             93, 239, 141, 131,  66, 190, 237, 127,
+            104, 191, 138, 217, 227,   1,  92,  14,
+    };
+
+    test("Invalid key: ");
+    s = natsKeys_Sign("ABC", nonce, &out, &outLen);
+    testCond((s == NATS_ERR)
+            && (out == NULL)
+            && (outLen == 0)
+            && (nats_GetLastError(NULL) != NULL)
+            && (strstr(nats_GetLastError(NULL), NKEYS_INVALID_ENCODED_KEY) != NULL));
+    nats_clearLastError();
+
+    // This is generated from XYTHISISNOTAVALIDSEED with correct checksum.
+    // Expect to get invalid seed
+    test("Invalid seed: ");
+    s = natsKeys_Sign("LBMVISCJKNEVGTSPKRAVMQKMJFCFGRKFIQ52C", nonce, &out, &outLen);
+    testCond((s == NATS_ERR)
+                && (out == NULL)
+                && (outLen == 0)
+                && (nats_GetLastError(NULL) != NULL)
+                && (strstr(nats_GetLastError(NULL), NKEYS_INVALID_SEED) != NULL));
+    nats_clearLastError();
+
+    test("Invalid prefix: ");
+    s = natsKeys_Sign("SBAUEQ2EIVDEOSCJJJFUYTKOJ5IFCUSTKRKVMV2YLFNECQSDIRCUMR2IJFFEWTCNJZHVAUKSKNKFKVSXLBMVUQKCINCEKRSHJBEUUS2MJVHE6UCRKJJVIVKWK5MFSWV2QA", nonce, &out, &outLen);
+    testCond((s == NATS_ERR)
+                && (out == NULL)
+                && (outLen == 0)
+                && (nats_GetLastError(NULL) != NULL)
+                && (strstr(nats_GetLastError(NULL), NKEYS_INVALID_PREFIX) != NULL));
+    nats_clearLastError();
+
+    // This is the valid seed: SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY
+    // Make the checksum incorrect by changing last 2 bytes.
+    test("Invalid checksum: ");
+    s = natsKeys_Sign("SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4AA", nonce, &out, &outLen);
+    testCond((s == NATS_ERR)
+                && (out == NULL)
+                && (outLen == 0)
+                && (nats_GetLastError(NULL) != NULL)
+                && (strstr(nats_GetLastError(NULL), NKEYS_INVALID_CHECKSUM) != NULL));
+    nats_clearLastError();
+
+    // Now use valid SEED
+    test("Sign ok: ");
+    s = natsKeys_Sign("SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY", nonce, &out, &outLen);
+    testCond((s == NATS_OK)
+                && (out != NULL)
+                && (outLen == NKEYS_SIGN_BYTES)
+                && (memcmp(out, expected, sizeof(expected)) == 0));
+    free(out);
+    out = NULL;
 }
 
 natsStatus
@@ -10904,6 +11086,7 @@ test_NextMsgCallOnAsyncSub(void)
     _stopServer(serverPid);
 }
 
+
 static void
 test_ServersOption(void)
 {
@@ -12582,6 +12765,8 @@ test_ServerPoolUpdatedOnClusterUpdate(void)
     _destroyDefaultThreadArgs(&arg);
 }
 
+
+
 static void
 test_Version(void)
 {
@@ -13228,6 +13413,7 @@ _startMockupServerThread(void *closure)
     natsThread          *t = NULL;
     struct threadArg    *arg = (struct threadArg*) closure;
     natsSockCtx         ctx;
+    testCheckInfoCB     checkInfoCB = NULL;
 
     memset(&ctx, 0, sizeof(natsSockCtx));
 
@@ -13235,6 +13421,7 @@ _startMockupServerThread(void *closure)
     natsMutex_Lock(arg->m);
     arg->status = s;
     natsCondition_Signal(arg->c);
+    checkInfoCB = arg->checkInfoCB;
     natsMutex_Unlock(arg->m);
 
     if (((ctx.fd = accept(sock, NULL, NULL)) == NATS_SOCK_INVALID)
@@ -13258,6 +13445,8 @@ _startMockupServerThread(void *closure)
 
             // Read connect and ping commands sent from the client
             s = natsSock_ReadLine(&ctx, buffer, sizeof(buffer));
+            if ((s == NATS_OK) && (checkInfoCB != NULL))
+                s = (*checkInfoCB)(buffer);
             if (s == NATS_OK)
                 s = natsSock_ReadLine(&ctx, buffer, sizeof(buffer));
         }
@@ -14003,6 +14192,178 @@ test_GetClientID(void)
 
     _destroyDefaultThreadArgs(&arg);
 }
+
+static natsStatus
+_userJWTCB(void *closure, char **userJWT)
+{
+    if (closure != NULL)
+        return NATS_ERR;
+
+    *userJWT = strdup("some user jwt");
+
+    return NATS_OK;
+}
+
+static natsStatus
+_sigCB(const char* nonce, void *closure, unsigned char **psig, int *sigLen)
+{
+    const unsigned char correctSign[] = {
+            155, 157,   8, 183,  93, 154,  78,   7,
+            219,  39,  11,  16, 134, 231,  46, 142,
+            168,  87, 110, 202, 187, 180, 179,  62,
+             49, 255, 225,  74,  48,  80, 176, 111,
+            248, 162, 121, 188, 203, 101, 100, 195,
+            162,  70, 213, 182, 220,  14,  71, 113,
+             93, 239, 141, 131,  66, 190, 237, 127,
+            104, 191, 138, 217, 227,   1,  92,  14,
+    };
+    int i;
+    unsigned char *sig = NULL;
+    unsigned char *ptr = NULL;
+
+    if (closure != NULL)
+        return NATS_ERR;
+
+    sig = malloc(64);
+    ptr = sig;
+
+    for (i=0; i<64; i++)
+    {
+        (*ptr) = correctSign[i];
+        ptr++;
+    }
+
+    *psig = sig;
+    *sigLen = 64;
+
+    return NATS_OK;
+}
+
+static natsStatus
+_checkJWTAndSigCB(char *buffer)
+{
+    // UserJWT callback should have returned this...
+    if (strstr(buffer, "some user jwt") == NULL)
+        return NATS_ERR;
+
+    // The server is sending the nonce "nonce" and we
+    // use a seed that should have produced a signature
+    // that converted to base64 should be:
+    if (strstr(buffer, "m50It12aTgfbJwsQhucujqhXbsq7tLM-Mf_hSjBQsG_4onm8y2Vkw6JG1bbcDkdxXe-Ng0K-7X9ov4rZ4wFcDg") == NULL)
+        return NATS_ERR;
+
+    return NATS_OK;
+}
+
+static void
+test_UserCredsCallbacks(void)
+{
+    natsStatus          s;
+    natsConnection      *nc     = NULL;
+    natsOptions         *opts   = NULL;
+    natsPid             pid     = NATS_INVALID_PID;
+    natsThread          *t      = NULL;
+    struct threadArg    arg;
+
+    s = natsOptions_Create(&opts);
+    if (s != NATS_OK)
+        FAIL("Unable to create options for test UserCredsCallbacks");
+
+    test("Invalid arg (opts is NULL): ");
+    s = natsOptions_SetUserCredentialsCallbacks(NULL, _userJWTCB, NULL, _sigCB, NULL);
+    testCond(s == NATS_INVALID_ARG);
+
+    s = NATS_OK;
+    test("Invalid arg (user CB is NULL): ");
+    s = natsOptions_SetUserCredentialsCallbacks(opts, NULL, NULL, _sigCB, NULL);
+    testCond(s == NATS_INVALID_ARG);
+
+    s = NATS_OK;
+    test("Invalid arg (sig CB is NULL): ");
+    s = natsOptions_SetUserCredentialsCallbacks(opts, _userJWTCB, NULL, NULL, NULL);
+    testCond(s == NATS_INVALID_ARG);
+
+    test("Set options OK: ");
+    s = natsOptions_SetUserCredentialsCallbacks(opts, _userJWTCB, NULL, _sigCB, NULL);
+    testCond(s == NATS_OK);
+
+    // We first check that we get error when callbacks do return error.
+    // For that part, we don't need that the server sends the nonce.
+
+    pid = _startServer("nats://127.0.0.1:4222", NULL, true);
+    CHECK_SERVER_STARTED(pid);
+
+    // Create a connection. The user JWT callback is going to return
+    // an error, ensure connection fails.
+    test("UserJWTCB returns error: ");
+    s = natsOptions_SetUserCredentialsCallbacks(opts, _userJWTCB, (void*) "fail", _sigCB, NULL);
+    if (s == NATS_OK)
+        s = natsConnection_Connect(&nc, opts);
+    testCond(s == NATS_ERR);
+
+    s = NATS_OK;
+    test("SignatureCB returns error: ");
+    s = natsOptions_SetUserCredentialsCallbacks(opts, _userJWTCB, NULL, _sigCB, (void*) "fail");
+    if (s == NATS_OK)
+        s = natsConnection_Connect(&nc, opts);
+    testCond(s == NATS_ERR);
+
+    _stopServer(pid);
+
+
+    // Start fake server that will send predefined "nonce" so we can check
+    // that connection is sending appropriate jwt and signature.
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s == NATS_OK)
+    {
+        // Set this to error, the mock server should set it to OK
+        // if it can start successfully.
+        arg.status = NATS_ERR;
+        arg.checkInfoCB = _checkJWTAndSigCB;
+        arg.string = "INFO {\"server_id\":\"22\",\"version\":\"latest\",\"go\":\"latest\",\"port\":4222,\"max_payload\":1048576,\"nonce\":\"nonce\"}\r\n";
+        s = natsThread_Create(&t, _startMockupServerThread, (void*) &arg);
+    }
+    if (s == NATS_OK)
+    {
+        // Wait for server to be ready
+        natsMutex_Lock(arg.m);
+        while ((s != NATS_TIMEOUT) && (arg.status != NATS_OK))
+            s = natsCondition_TimedWait(arg.c, arg.m, 2000);
+        natsMutex_Unlock(arg.m);
+    }
+    if (s != NATS_OK)
+    {
+        if (t != NULL)
+        {
+            natsThread_Join(t);
+            natsThread_Destroy(t);
+        }
+        natsOptions_Destroy(opts);
+        _destroyDefaultThreadArgs(&arg);
+        FAIL("Unable to setup test");
+    }
+
+    s = NATS_OK;
+    test("Connect sends proper JWT and Signature: ");
+    s = natsOptions_SetUserCredentialsCallbacks(opts, _userJWTCB, NULL, _sigCB, NULL);
+    if (s == NATS_OK)
+        s = natsConnection_Connect(&nc, opts);
+    testCond(s == NATS_OK);
+
+    // Notify mock server we are done
+    natsMutex_Lock(arg.m);
+    arg.done = true;
+    natsCondition_Signal(arg.c);
+    natsMutex_Unlock(arg.m);
+
+    natsConnection_Destroy(nc);
+    natsOptions_Destroy(opts);
+    natsThread_Join(t);
+    natsThread_Destroy(t);
+
+    _destroyDefaultThreadArgs(&arg);
+}
+
 
 static void
 test_SSLBasic(void)
@@ -16536,6 +16897,10 @@ static testInfo allTests[] =
     {"natsErrWithLongText",             test_natsErrWithLongText},
     {"natsErrStackMoreThanMaxFrames",   test_natsErrStackMoreThanMaxFrames},
     {"natsMsg",                         test_natsMsg},
+    {"natsBase32",                      test_natsBase32Decode},
+    {"natsBase64",                      test_natsBase64Encode},
+    {"natsCRC16",                       test_natsCRC16},
+    {"nkeys",                           test_natsKeys},
 
     // Package Level Tests
 
@@ -16645,6 +17010,7 @@ static testInfo allTests[] =
     {"DrainSub",                        test_DrainSub},
     {"DrainConn",                       test_DrainConn},
     {"GetClientID",                     test_GetClientID},
+    {"UserCredsCallbacks",              test_UserCredsCallbacks},
     {"SSLBasic",                        test_SSLBasic},
     {"SSLVerify",                       test_SSLVerify},
     {"SSLVerifyHostname",               test_SSLVerifyHostname},

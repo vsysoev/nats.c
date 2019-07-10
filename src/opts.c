@@ -994,6 +994,114 @@ natsOptions_UseOldRequestStyle(natsOptions *opts, bool useOldStype)
 }
 
 static void
+_freeUserCreds(userCreds *uc)
+{
+    if (uc == NULL)
+        return;
+
+    NATS_FREE(uc->userOrChainedFile);
+    NATS_FREE(uc->seedFile);
+    NATS_FREE(uc);
+}
+
+static natsStatus
+_createUserCreds(userCreds **puc, char *uocf, char *sf)
+{
+    natsStatus  s   = NATS_OK;
+    userCreds   *uc = NULL;
+
+    uc = NATS_CALLOC(1, sizeof(userCreds));
+    if (uc == NULL)
+        return nats_setDefaultError(NATS_NO_MEMORY);
+
+    uc->userOrChainedFile = NATS_STRDUP(uocf);
+    if (uc->userOrChainedFile == NULL)
+        s = nats_setDefaultError(NATS_NO_MEMORY);
+    if ((s == NATS_OK) && sf != NULL)
+    {
+        uc->seedFile = NATS_STRDUP(sf);
+        if (uc->seedFile == NULL)
+            s = nats_setDefaultError(NATS_NO_MEMORY);
+    }
+    if (s != NATS_OK)
+        _freeUserCreds(uc);
+    else
+        *puc = uc;
+
+    return NATS_UPDATE_ERR_STACK(s);
+}
+
+natsStatus
+_userFromFile(void *closure, char **userJWT)
+{
+    natsStatus  s = NATS_OK;
+
+    return s;
+}
+
+natsStatus
+_sigCB(const char *nonce, void *closure, uint8_t **sig, int *sigLen)
+{
+    natsStatus  s = NATS_OK;
+
+    return s;
+}
+
+natsStatus
+natsOptions_SetUserCredentialsFromFiles(natsOptions *opts, char *userOrChainedFile, char *seedFile)
+{
+    natsStatus  s   = NATS_OK;
+    userCreds   *uc = NULL;
+
+    if ((userOrChainedFile == NULL) || (userOrChainedFile[0] == '\0'))
+        return nats_setError(NATS_INVALID_ARG, "%s", "user or chained file need to be specified");
+
+    s = _createUserCreds(&uc, userOrChainedFile, seedFile);
+    if (s != NATS_OK)
+        return NATS_UPDATE_ERR_STACK(s);
+
+    LOCK_AND_CHECK_OPTIONS(opts, 0);
+
+    _freeUserCreds(opts->userCreds);
+    opts->userCreds = uc;
+
+    opts->userJWTHandler = _userFromFile;
+    opts->userJWTClosure = (void*) opts;
+
+    opts->sigHandler = _sigCB;
+    opts->sigClosure = (void*) opts;
+
+    UNLOCK_OPTS(opts);
+
+    return NATS_OK;
+}
+
+natsStatus
+natsOptions_SetUserCredentialsCallbacks(natsOptions *opts,
+                                        natsUserJWTHandler      ujwtCB,
+                                        void                    *ujwtClosure,
+                                        natsSignatureHandler    sigCB,
+                                        void                    *sigClosure)
+{
+    natsStatus  s   = NATS_OK;
+
+    LOCK_AND_CHECK_OPTIONS(opts, ((ujwtCB == NULL) || (sigCB == NULL)));
+
+    _freeUserCreds(opts->userCreds);
+    opts->userCreds = NULL;
+
+    opts->userJWTHandler = ujwtCB;
+    opts->userJWTClosure = ujwtClosure;
+
+    opts->sigHandler = sigCB;
+    opts->sigClosure = sigClosure;
+
+    UNLOCK_OPTS(opts);
+
+    return NATS_OK;
+}
+
+static void
 _freeOptions(natsOptions *opts)
 {
     if (opts == NULL)
@@ -1007,6 +1115,7 @@ _freeOptions(natsOptions *opts)
     NATS_FREE(opts->token);
     natsMutex_Destroy(opts->mu);
     natsSSLCtx_release(opts->sslCtx);
+    _freeUserCreds(opts->userCreds);
     NATS_FREE(opts);
 }
 
@@ -1077,6 +1186,7 @@ natsOptions_clone(natsOptions *opts)
     cloned->user    = NULL;
     cloned->password= NULL;
     cloned->token   = NULL;
+    cloned->userCreds = NULL;
 
     // Also, set the number of servers count to 0, until we update
     // it (if necessary) when calling SetServers.
@@ -1101,6 +1211,11 @@ natsOptions_clone(natsOptions *opts)
 
     if ((s == NATS_OK) && (opts->sslCtx != NULL))
         cloned->sslCtx = natsSSLCtx_retain(opts->sslCtx);
+
+    if ((s == NATS_OK) && (opts->userCreds != NULL))
+        s = natsOptions_SetUserCredentialsFromFiles(cloned,
+                                                    opts->userCreds->userOrChainedFile,
+                                                    opts->userCreds->seedFile);
 
     if (s != NATS_OK)
     {
